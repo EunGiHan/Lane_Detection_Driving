@@ -6,6 +6,7 @@ import rospy
 import numpy as np
 
 from sensor_msgs.msg import Image
+#from xycar_msgs.msg import xycar_motor
 from cv_bridge import CvBridge
 
 class Sliding:
@@ -15,6 +16,7 @@ class Sliding:
 
         ### cvBridge
         self.bridge = CvBridge()
+        self.temp_frame = np.empty(shape=[0])
         self.frame = np.empty(shape=[0])
 
         ### 카메라 정보
@@ -40,9 +42,6 @@ class Sliding:
 
         warp_x_margin = 20  # 마진은 왜 주는 거야....???
         warp_y_margin = 3
-
-        # self.src_trapezoid = [[230, 300], [45, 450], [], []]
-            # 위 왼쪽 / 아래 왼쪽 / 위 오른쪽 / 아래 오른쪽
         
         self.warp_src = np.array([
             [230 - warp_x_margin, 300 - warp_y_margin],
@@ -74,9 +73,12 @@ class Sliding:
         self.left_fit = None
         self.right_fit = None
 
-
     def img_callback(self, data):
         self.frame = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        #self.temp_frame = self.bridge.imgmsg_to_cv2(data, "bgr8")
+
+    def set_frame(self):
+        self.frame = self.temp_frame
 
     ### 카메라에서 받아온 이미지를 캘리브레이션
     def calibrate_img(self):
@@ -170,6 +172,7 @@ class Sliding:
         y_max = self.warp_img.shape[0]  # 와핑 이미지의 세로 길이
         plot_y = np.linspace(0, y_max - 1, y_max) # 0부터 y_max - 1까지 y_max개의 점을 찍음
         color_warp_area = np.zeros_like(self.warp_img).astype(np.uint8)  # 원본 이미지에 그릴 탐색 영역. 와핑 이미지와 같은 모양의 0으로 채워진 배열
+        color_warp_line = np.zeros_like(self.warp_img).astype(np.uint8)
 
         ### 피팅된 왼, 오른쪽 이차식의 x 값들
         left_fit_x = self.left_fit[0]*plot_y**2 + self.left_fit[1]*plot_y + self.left_fit[2]
@@ -184,30 +187,202 @@ class Sliding:
         pts = np.hstack((pts_left, pts_right))
             # [lx1, y1], [lx2, y2], ..., [rx1, y1], [rx2, y2], ...
 
+
+        horizontal_pos = int(self.warp_img_height / 2 + 50)
+        self.left_x = int(self.left_fit[0]*horizontal_pos**2 + self.left_fit[1]*horizontal_pos + self.left_fit[2])
+        self.right_x = int(self.right_fit[0]*horizontal_pos**2 + self.right_fit[1]*horizontal_pos + self.right_fit[2])
+        self.left_slope = 2*self.left_fit[0]*horizontal_pos + self.left_fit[1]    # 직선의 기울기(미분)
+        self.right_slope = 2*self.right_fit[0]*horizontal_pos + self.right_fit[1]    # 직선의 기울기(미분)
+
+        if self.left_slope < 0 and self.right_slope > 0:
+            # 두 직선의 기울기가 V자 모양이면 이상한 상태임
+            self.cross_pos = 240    # 화면 중앙으로 설정
+            self.cross_pos_y = -1
+        elif self.left_slope == self.right_slope: #abs(left_slope-right_slope)<10:
+            # 비교값 임의 설정함. 두 직선이 거의 평행한 경우. 아마 곡선 구간일 듯
+            self.cross_pos = 480    # 기울기 양수면 화면 맨 오른쪽으로 설정
+            ## TODO 기울기 음수면 0으로
+            self.cross_pos_y = -2
+        else:
+            # 아마 직선 구간. 교점 구하자
+            d = (self.right_x - self.left_x) / (1+(self.left_slope/self.right_slope))
+            self.cross_pos = self.left_x + d
+            self.cross_pos_y = self.left_slope * d
+
+        self.cross_pos = int(self.cross_pos)
+        self.cross_pos_y = int(self.cross_pos_y)
+        #print(self.left_x, self.right_x, d, self.cross_pos, self.cross_pos_y)
+
+        self.pixel_error = self.cross_pos - self.warp_img_height / 2  # 음수면 교점이 왼쪽, 양수면 오른쪽
+
+        if self.pixel_error < 0:
+            self.pixel_error = 0
+        elif self.pixel_error > self.warp_img_width:
+            self.pixel_error = self.warp_img_width
+
         ### 탐색 영역을 프레임에 표시
         color_warp_area = cv2.fillPoly(color_warp_area, np.int_([pts]), (0, 255, 0))    # 모든 포인트를 이은 다각형 내부를 초록색으로 표시
+
+        color_warp_line = cv2.line(color_warp_line, (0, horizontal_pos), (self.img_width, horizontal_pos), (0, 255, 0), 2)
+        if self.cross_pos_y == -1: #V자
+            pass
+        elif self.cross_pos_y == -2: # 평행
+            pass
+        else:
+            cv2.line(color_warp_line, (self.left_x, horizontal_pos), (self.cross_pos, self.cross_pos_y), (255, 0, 0), 2)
+            cv2.line(color_warp_line, (self.right_x, horizontal_pos), (self.cross_pos, self.cross_pos_y), (255, 0, 0), 2)
+
         src_warp = cv2.warpPerspective(color_warp_area, self.perspec_mat_inv, (self.img_width, self.img_height))    # 원근변환으로 다각형을 변환
+        src_warp2 = cv2.warpPerspective(color_warp_line, self.perspec_mat_inv, (self.img_width, self.img_height))
+
         self.frame = cv2.addWeighted(self.frame, 1, src_warp, 0.3, 0)    # 원본에 0.3의 투명도로 다각형을 덧그림
-        cv2.imshow("camera_view", self.frame)
+        self.frame = cv2.addWeighted(self.frame, 1, src_warp2, 1, 0)    # 원본에 0.3의 투명도로 다각형을 덧그림
+        cv2.imshow("camera_view1", self.frame)
+
+    # def view_frame(self, horizontal_pos, left_x, right_x, cross_pos_x, cross_pos_y):
+    #     # 와핑 안 시켜줘서 이상함
+    #     # cross_point가 구간 벗어나면 안 보일 듯
+    #     cv2.line(self.frame, (0, horizontal_pos), (self.img_width, horizontal_pos), (0, 255, 0), 2)
+    #     if cross_pos_y == -1: #V자
+    #         pass
+    #     elif cross_pos_y == -2: # 평행
+    #         pass
+    #     else:
+    #         cv2.line(self.frame, (left_x, horizontal_pos), (cross_pos_x, cross_pos_y), (255, 0, 0), 2)
+    #         cv2.line(self.frame, (right_x, horizontal_pos), (cross_pos_x, cross_pos_y), (255, 0, 0), 2)
+    #     cv2.imshow("camera_view2", self.frame)
+
+class Drive:
+    def __init__(self):
+        #self.pub = rospy.Publisher('xycar_motor', xycar_motor, queue_size=1)
+
+        self.horizontal_pos = 350 # 교점을 찾을 가로 선. pixel
+        self.vertical_half = 320 # 영상 중점. pixel
+
+        self.left_x, self.right_x = 320, 320
+        self.left_slope, self.right_slope = 1, -1
+
+        self.cross_pos = 240 # 두 직선 교점 x좌표
+        self.cross_pos_y = 0    # 두 직선 교점 y좌표
+        self.pixel_error = 0 # 교점 - 화면 중점
+
+        self.angle_kp = 0.45
+        self.angle_ki = 0.0007
+        self.angle_kd = 0.25
+        self.angle_d_err = 0
+        self.angle_p_err = 0
+        self.angle_i_err = 0
+        self.angle_max_i_err = 10
+        self.angle_u = 0
+
+        self.steer_angle = 0
+
+    def find_cross_pos(self, left_fit, right_fit):
+        self.left_x = left_fit[0]*self.horizontal_pos**2 + left_fit[1]*self.horizontal_pos + left_fit[2]
+        self.right_x = right_fit[0]*self.horizontal_pos**2 + right_fit[1]*self.horizontal_pos + right_fit[2]
+        self.left_slope = 2*left_fit[0]*self.horizontal_pos + left_fit[1]    # 직선의 기울기(미분)
+        self.right_slope = 2*right_fit[0]*self.horizontal_pos + right_fit[1]    # 직선의 기울기(미분)
+
+        if self.left_slope < 0 and self.right_slope > 0:
+            # 두 직선의 기울기가 V자 모양이면 이상한 상태임
+            self.cross_pos = 240    # 화면 중앙으로 설정
+            self.cross_pos_y = -1
+        elif self.left_slope == self.right_slope: #abs(left_slope-right_slope)<10:
+            # 비교값 임의 설정함. 두 직선이 거의 평행한 경우. 아마 곡선 구간일 듯
+            self.cross_pos = 480    # 기울기 양수면 화면 맨 오른쪽으로 설정
+            ## TODO 기울기 음수면 0으로
+            self.cross_pos_y = -2
+        else:
+            # 아마 직선 구간. 교점 구하자
+            d = (self.right_x - self.left_x) / (1-(self.left_slope/self.right_slope))
+            self.cross_pos = self.left_x + d
+            self.cross_pos_y = self.left_slope * d        
+
+        self.pixel_error = self.cross_pos - self.vertical_half  # 음수면 교점이 왼쪽, 양수면 오른쪽
+
+        if self.pixel_error < 0:
+            self.pixel_error = 0
+        elif self.pixel_error > 640:
+            self.pixel_error = 640
+
+    # def angle_pid(self):
+    #     self.angle_d_err = self.pixel_error - self.angle_p_err
+    #     self.angle_p_err = self.pixel_error
+    #     self.angle_i_err += self.pixel_error
+        
+    #     if self.angle_i_err > self.angle_max_i_err:
+    #         self.angle_i_err = 0    # 적분 초기화
+        
+    #     self.angle_u = (self.angle_kp * self.angle_p_err) + (self.angle_ki * self.angle_i_err) +(self.angle_kd * self.angle_d_err)
+    
+    def angle_pid(self, pixel_error):
+        self.angle_d_err = pixel_error - self.angle_p_err
+        self.angle_p_err = pixel_error
+        self.angle_i_err += pixel_error
+        
+        if self.angle_i_err > self.angle_max_i_err:
+            self.angle_i_err = 0    # 적분 초기화
+        
+        self.angle_u = (self.angle_kp * self.angle_p_err) + (self.angle_ki * self.angle_i_err) +(self.angle_kd * self.angle_d_err)
+
+    def speed_pid(self):
+        # self.speed = (-50) + self.kp_distance * self.dist_to_goal
+        # if self.speed > self.thruster_power:
+        #     self.speed = self.thruster_power
+        pass
+
+    def pub_to_motor(self, pixel_error):
+        self.angle_pid(pixel_error)
+        self.steer_angle = int((self.angle_u - 0) * (50 - (-50)) / (640 - 0) + (-50))
+            # (x-input_min)*(output_max-output_min)/(input_max-input_min)+output_min
+
+        ## speed_pid = self.speed_pid
+        # motor_msg = xycar_motor()
+        # motor_msg.speed = 30 #speed
+        # motor_msg.angle = self.steer_angle
+        # self.pub.publish(motor_msg) #둘다 int32
 
 def main():
-    rospy.init_node("line_detector", anonymous=True)
+    rospy.init_node("lane_find", anonymous=True)
+    prev = rospy.Time.now()
 
     sliding = Sliding()
+    drive = Drive()
+
+    # sliding.set_frame()
 
     while not rospy.is_shutdown():
         if sliding.frame.size != (640*480*3):
+            print("Here")
             continue    # 640*480 이미지 한 장이 모이기 전까지 대기
-
+        
         sliding.calibrate_img()  # 왜곡 보정하기 위해 캘리브레이션
         sliding.warp_image()    # 와핑으로 이미지 변형
         sliding.binalization()
         sliding.sliding_win()
         sliding.draw_line_to_src()
 
+        #drive.find_cross_pos(sliding.left_fit, sliding.right_fit)
+    
+        #sliding.view_frame(drive.horizontal_pos, int(drive.left_x), int(drive.right_x),
+                            #int(drive.cross_pos), int(drive.cross_pos_y))
+
+        time_diff = rospy.Time.now() - prev
+        if time_diff.secs > 0.5:
+            drive.pub_to_motor(sliding.pixel_error)
+            print("="*30)
+            print("left lane: {0}    right lane: {1}".format(sliding.left_x, sliding.right_x))
+            print("left slope: {0}    right slope: {1}".format(sliding.left_slope, sliding.right_slope))
+            print("cross_pos: ({0}, {1})    pixel_error: {2}".format(sliding.cross_pos, sliding.cross_pos_y, sliding.pixel_error))
+            print("angle u: {0}    steering: {1}".format(drive.angle_u, drive.steer_angle))
+            print("\n\n")
+            time_diff = rospy.Time(0)
+            prev = rospy.Time.now()
+
+        # sliding.set_frame()
         if cv2.waitKey(1) == 27:
             return
-    
+
     rospy.spin()
 
 
@@ -223,10 +398,6 @@ if __name__=='__main__':
     - 아니면 영상 밖의 위치를 찾을까? 
     - Day1 참고
 - ROI 위쪽에서는 차선 못 찾는 경우도 있었음
-- 조향각 결정
-    - 두 직선이 만나는 교점의 x좌표값과 화면의 중앙을 비교해 정도를 결정
 - PID 제어
-    - 조향각을 필터링하거나
-    - 차선 위치값을 필터링
     - 곡선에서는 느리게, 직선에서는 빠르게 주행
 """
